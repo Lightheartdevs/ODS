@@ -166,6 +166,10 @@ EOF
             throw "required function block not found"
         }
         $helperCode = $code.Substring($assertStart, $launchStart - $assertStart)
+        function Write-Utf8NoBom {
+            param([string]$Path, [string]$Content)
+            [System.IO.File]::WriteAllText($Path, $Content, (New-Object System.Text.UTF8Encoding($false)))
+        }
         function Write-AIError { param([string]$Message) Write-Host "ERROR:$Message" }
         function Write-AI { param([string]$Message) Write-Host "INFO:$Message" }
         Invoke-Expression $helperCode
