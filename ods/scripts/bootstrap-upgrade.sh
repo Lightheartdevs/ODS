@@ -275,6 +275,50 @@ discard_active_model_config_snapshot() {
     fi
 }
 
+restore_docker_llama_server_after_swap_failure() {
+    local health_url="${1:-}"
+    local compose_arg_count=0
+    local rollback_healthy=false
+
+    log "Restoring previous active model config after Docker llama-server swap failure..."
+    if ! restore_active_model_config; then
+        log "WARNING: could not restore previous active model config; inspect $ENV_FILE and $MODELS_INI"
+        return 1
+    fi
+
+    if declare -p COMPOSE_ARGS >/dev/null 2>&1; then
+        compose_arg_count=${#COMPOSE_ARGS[@]}
+    fi
+    if [[ "$compose_arg_count" -eq 0 || -z "${DOCKER_COMPOSE_CMD:-}" ]]; then
+        log "WARNING: cannot recreate llama-server with previous config because compose flags are unavailable."
+        return 1
+    fi
+
+    log "Recreating llama-server with previous active model config..."
+    if ! compose_recreate_llama_server_with_retry "${COMPOSE_ARGS[@]}"; then
+        log "WARNING: rollback recreate failed; inspect docker logs ods-llama-server"
+        return 1
+    fi
+
+    [[ -n "$health_url" ]] || return 0
+    log "Waiting for restored llama-server health at $health_url ..."
+    for _rollback_i in $(seq 1 60); do
+        if curl -sf --max-time 5 "$health_url" >/dev/null 2>&1; then
+            rollback_healthy=true
+            break
+        fi
+        sleep 5
+    done
+
+    if [[ "$rollback_healthy" == "true" ]]; then
+        log "Rollback complete: llama-server is healthy with the previous active model config."
+        return 0
+    fi
+
+    log "WARNING: rollback config was restored, but llama-server did not become healthy within the wait window."
+    return 1
+}
+
 BOOTSTRAP_SWAP_BACKUP_PATH=""
 
 move_bootstrap_model_aside_for_windows_swap() {
@@ -1141,6 +1185,7 @@ fi
 
 _windows_lemonade_swap_applies=false
 _windows_native_llama_swap_applies=false
+_docker_llama_swap_applies=false
 if is_windows_bash; then
     _runtime_for_swap="$(read_env_value AMD_INFERENCE_RUNTIME | tr '[:upper:]' '[:lower:]')"
     _backend_for_swap="$(read_env_value LLM_BACKEND | tr '[:upper:]' '[:lower:]')"
@@ -1153,10 +1198,15 @@ if is_windows_bash; then
         && [[ "$_runtime_mode_for_swap" == "windows-llama-server-fallback" || ( "$_runtime_for_swap" == "llama-server" && "$_location_for_swap" == "host" ) ]]; then
         _windows_native_llama_swap_applies=true
     fi
+elif [[ -n "$DOCKER_CMD" ]]; then
+    # Linux Docker installs mutate .env/models.ini before attempting a
+    # llama-server hot-swap. Snapshot whenever Docker is available so every
+    # Docker failure path can restore the last known-good model config.
+    _docker_llama_swap_applies=true
 fi
 
-if [[ "$_windows_lemonade_swap_applies" == "true" || "$_windows_native_llama_swap_applies" == "true" ]]; then
-    log "Snapshotting active Windows model config before full-model swap..."
+if [[ "$_windows_lemonade_swap_applies" == "true" || "$_windows_native_llama_swap_applies" == "true" || "$_docker_llama_swap_applies" == "true" ]]; then
+    log "Snapshotting active model config before full-model swap..."
     if ! snapshot_active_model_config; then
         discard_active_model_config_snapshot
         write_status "failed" 100 "$TOTAL_BYTES" "$TOTAL_BYTES" 0 \
@@ -1376,7 +1426,9 @@ elif [[ -n "$DOCKER_CMD" ]] && $DOCKER_CMD ps --filter name=ods-llama-server --f
         # installer; both paths can recreate llama-server from the updated .env.
         log "WARNING: unable to recover compose flags — leaving the current llama-server container untouched."
         log "Manual recovery: re-run the installer, or restore $INSTALL_DIR/.compose-flags and run the ODS CLI restart command."
-        write_status "failed"
+        restore_active_model_config || log "WARNING: could not restore previous active model config; inspect $ENV_FILE and $MODELS_INI"
+        write_status "failed" 100 "$TOTAL_BYTES" "$TOTAL_BYTES" 0 \
+            "Full model downloaded and verified, but ODS could not recover compose flags for Docker hot-swap. Previous active model config restored; re-run to retry."
         exit 1
     fi
 
@@ -1478,6 +1530,7 @@ elif [[ -n "$DOCKER_CMD" ]] && $DOCKER_CMD ps --filter name=ods-llama-server --f
     if $_healthy; then
         log "SUCCESS: llama-server is running with $FULL_LLM_MODEL"
         HOT_SWAP_VERIFIED=true
+        discard_active_model_config_snapshot
         # Regenerate lemonade.yaml with the new model ID and restart LiteLLM.
         # Lemonade exposes models as "extra.<GGUF_FILE>" — the config must
         # reference the exact ID, not a wildcard passthrough.
@@ -1739,8 +1792,12 @@ LITELLM_UPGRADE_EOF
     else
         log "WARNING: llama-server health check timed out. The model may still be loading."
         log "Check: docker logs ods-llama-server"
+        _rollback_status="Previous active model config restore was attempted; inspect docker logs ods-llama-server and re-run to retry."
+        if restore_docker_llama_server_after_swap_failure "$_health_url"; then
+            _rollback_status="Previous active model config restored and llama-server is healthy; re-run to retry the full-model swap."
+        fi
         write_status "failed" 100 "$TOTAL_BYTES" "$TOTAL_BYTES" 0 \
-            "Full model downloaded and verified, but Docker llama-server did not become healthy after the hot-swap. Bootstrap model kept; inspect docker logs ods-llama-server and re-run to retry."
+            "Full model downloaded and verified, but Docker llama-server did not become healthy after the hot-swap. ${_rollback_status}"
         exit 1
     fi
 elif [[ -f "$INSTALL_DIR/data/.llama-server.pid" ]]; then
@@ -1877,6 +1934,7 @@ elif [[ -f "$INSTALL_DIR/data/.llama-server.pid" ]]; then
     fi
 else
     log "Docker services not running. Config updated — full model will load on next start."
+    discard_active_model_config_snapshot
 fi
 
 # ── Phase 5b: Remove bootstrap model only after verified full-model serving ──

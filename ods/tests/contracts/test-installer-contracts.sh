@@ -49,6 +49,9 @@ bash tests/contracts/test-external-lemonade-contracts.sh
 echo "[contract] bootstrap hot-swap force-recreate"
 bash tests/test-bootstrap-upgrade-hotswap-contract.sh
 
+echo "[contract] bootstrap Docker hot-swap rollback"
+bash tests/test-bootstrap-upgrade-docker-rollback.sh
+
 echo "[contract] ODS rename migration guardrails"
 grep -qF 'ODS_ALLOW_DREAMSERVER_PARALLEL' get-ods.sh \
   || { echo "[FAIL] get-ods.sh must require an explicit override before parallel DreamServer installs"; exit 1; }
