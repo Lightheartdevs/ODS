@@ -188,6 +188,14 @@ for svc in qdrant embeddings; do
     || { echo "[FAIL] ENABLE_RAG opt-out missing sync for '$svc' in $features_phase"; exit 1; }
 done
 
+echo "[contract] non-interactive reinstall reuses valid GPU assignment"
+grep -q '_load_existing_gpu_assignment_json' "$features_phase" \
+  || { echo "[FAIL] multi-GPU reinstall must load existing GPU assignment"; exit 1; }
+grep -q 'GPU_ASSIGNMENT_JSON_B64' "$features_phase" \
+  || { echo "[FAIL] multi-GPU reinstall must read persisted GPU_ASSIGNMENT_JSON_B64"; exit 1; }
+grep -q 'Reusing existing GPU assignment from .env' "$features_phase" \
+  || { echo "[FAIL] multi-GPU reinstall must log assignment reuse"; exit 1; }
+
 echo "[contract] every resolve-compose-stack.sh invocation passes --gpu-count"
 # The resolver's --gpu-count flag gates the multigpu-{backend}.yml overlay.
 # A caller that omits it silently resolves to a single-GPU stack on multi-GPU

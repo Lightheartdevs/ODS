@@ -472,13 +472,56 @@ _show_json() {
   echo ""; bootline; echo ""
 }
 
+_decode_base64_portable() {
+  if base64 --help 2>&1 | grep -q -- '--decode'; then
+    base64 --decode
+  elif base64 -d </dev/null >/dev/null 2>&1; then
+    base64 -d
+  else
+    base64 -D
+  fi
+}
+
+_load_existing_gpu_assignment_json() {
+  [[ "${DRY_RUN:-false}" == "true" ]] && return 1
+  [[ "${INTERACTIVE:-false}" == "true" ]] && return 1
+  [[ -f "$INSTALL_DIR/.env" ]] || return 1
+
+  local encoded decoded
+  encoded=$(awk -F= '$1=="GPU_ASSIGNMENT_JSON_B64"{print substr($0, index($0, "=") + 1); exit}' "$INSTALL_DIR/.env" 2>/dev/null | tr -d '\r' || true)
+  encoded="${encoded%\"}"
+  encoded="${encoded#\"}"
+  encoded="${encoded%\'}"
+  encoded="${encoded#\'}"
+  [[ -n "$encoded" ]] || return 1
+
+  decoded=$(printf '%s' "$encoded" | _decode_base64_portable 2>/dev/null) || return 1
+  echo "$decoded" | jq -e '.gpu_assignment.services.llama_server.gpus | length > 0' >/dev/null || return 1
+
+  # Reuse only when every saved service UUID still exists in the freshly
+  # detected topology. If the user changed hardware, fall back to automatic
+  # assignment against current free VRAM.
+  jq -e --argjson assignment "$decoded" '
+    ([.gpus[].uuid] | unique) as $known |
+    ([$assignment.gpu_assignment.services[]?.gpus[]?] | all(. as $u | $known | index($u)))
+  ' "$TOPOLOGY_FILE" >/dev/null || return 1
+
+  echo "$decoded" | jq -c '.'
+}
+
 # --- Multi-GPU Config TUI ---
 GPU_ASSIGNMENT_JSON=""
 
 # If it is not an interactive session, run automatic assignment with default values
 if ! $INTERACTIVE || $DRY_RUN; then
-    log "Non-interactive mode: running automatic GPU assignment with default values."
-    run_automatic
+    if _existing_assignment=$(_load_existing_gpu_assignment_json); then
+        GPU_ASSIGNMENT_JSON="$_existing_assignment"
+        success "Reusing existing GPU assignment from .env"
+        log "Use 'ods gpu reassign --auto' after install to recompute assignment against current free VRAM."
+    else
+        log "Non-interactive mode: running automatic GPU assignment with default values."
+        run_automatic
+    fi
 else
     bootline
     echo -e "${BGRN}MULTI-GPU CONFIGURATION${NC}"
